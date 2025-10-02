@@ -17,36 +17,34 @@ limitations under the License.
 package controller
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"reflect"
 	"strings"
-	"text/template"
-
-	"k8s.io/apimachinery/pkg/util/intstr"
-
-	"github.com/kubeflow/notebooks/workspaces/controller/internal/helper"
 
 	"github.com/go-logr/logr"
-
-	kubefloworgv1beta1 "github.com/kubeflow/notebooks/workspaces/controller/api/v1beta1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	kubefloworgv1beta1 "github.com/kubeflow/notebooks/workspaces/controller/api/v1beta1"
+	"github.com/kubeflow/notebooks/workspaces/controller/internal/helper"
 )
 
 const (
@@ -54,10 +52,8 @@ const (
 	workspaceNameLabel     = "notebooks.kubeflow.org/workspace-name"
 	workspaceSelectorLabel = "statefulset"
 
-	// KubeBuilder cache fields
-	kfCacheEventInvolvedObjectUidKey = ".involvedObject.uid"
-	kbCacheWorkspaceOwnerKey         = ".metadata.controller"
-	kbCacheWorkspaceKindField        = ".spec.kind"
+	// pod template constants
+	workspacePodTemplateContainerName = "main"
 
 	// lengths for resource names
 	generateNameSuffixLength = 6
@@ -85,10 +81,6 @@ const (
 	stateMsgUnknown                        = "Workspace is in an unknown state"
 )
 
-var (
-	apiGroupVersionStr = kubefloworgv1beta1.GroupVersion.String()
-)
-
 // WorkspaceReconciler reconciles a Workspace object
 type WorkspaceReconciler struct {
 	client.Client
@@ -107,7 +99,7 @@ type WorkspaceReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=services,verbs=create;delete;get;list;patch;update;watch
 // +kubebuilder:rbac:groups=networking.istio.io,resources=virtualservices,verbs=create;delete;get;list;patch;update;watch
 
-func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) { // nolint:gocyclo
+func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) { //nolint:gocyclo
 	log := log.FromContext(ctx)
 	log.V(2).Info("reconciling Workspace")
 
@@ -129,6 +121,11 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, nil
 	}
 
+	// copy the current Workspace status, so we can avoid unnecessary updates if the status hasn't changed
+	// NOTE: we dereference the DeepCopy of the status field because status fields are NOT pointers,
+	//       so otherwise the `equality.Semantic.DeepEqual` will always return false.
+	currentStatus := *workspace.Status.DeepCopy()
+
 	// fetch the WorkspaceKind
 	workspaceKindName := workspace.Spec.Kind
 	log = log.WithValues("workspaceKind", workspaceKindName)
@@ -148,8 +145,8 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// add finalizer to WorkspaceKind
 	// NOTE: finalizers can only be added to non-deleted objects
 	if workspaceKind.GetDeletionTimestamp().IsZero() {
-		if !controllerutil.ContainsFinalizer(workspaceKind, workspaceKindFinalizer) {
-			controllerutil.AddFinalizer(workspaceKind, workspaceKindFinalizer)
+		if !controllerutil.ContainsFinalizer(workspaceKind, WorkspaceKindFinalizer) {
+			controllerutil.AddFinalizer(workspaceKind, WorkspaceKindFinalizer)
 			if err := r.Update(ctx, workspaceKind); err != nil {
 				if apierrors.IsConflict(err) {
 					log.V(2).Info("update conflict while adding finalizer to WorkspaceKind, will requeue")
@@ -160,6 +157,10 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			}
 		}
 	}
+
+	// a restart pending means at least one current config is different from its desired config
+	// NOTE: we initialize this to false and only set it to true if we find a difference
+	workspace.Status.PendingRestart = false
 
 	// get the current and desired (after redirects) imageConfig
 	currentImageConfig, desiredImageConfig, imageConfigRedirectChain, err := getImageConfig(workspace, workspaceKind)
@@ -203,10 +204,14 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	//       will result in a forced restart of all Workspaces using the WorkspaceKind.
 	//
 
-	// if the Workspace is paused and a restart is pending, update the Workspace with the new options
-	if *workspace.Spec.Paused && workspace.Status.PendingRestart && !*workspace.Spec.DeferUpdates {
+	// if a restart is pending and the Workspace is paused, update the Workspace with the new options
+	if workspace.Status.PendingRestart && *workspace.Spec.Paused && !*workspace.Spec.DeferUpdates {
+
+		// update the Workspace with the new options
 		workspace.Spec.PodTemplate.Options.ImageConfig = workspace.Status.PodTemplateOptions.ImageConfig.Desired
 		workspace.Spec.PodTemplate.Options.PodConfig = workspace.Status.PodTemplateOptions.PodConfig.Desired
+
+		// update the Workspace
 		if err := r.Update(ctx, workspace); err != nil {
 			if apierrors.IsConflict(err) {
 				log.V(2).Info("update conflict while updating Workspace, will requeue")
@@ -215,15 +220,9 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			log.Error(err, "unable to update Workspace")
 			return ctrl.Result{}, err
 		}
-		workspace.Status.PendingRestart = false
-		if err := r.Status().Update(ctx, workspace); err != nil {
-			if apierrors.IsConflict(err) {
-				log.V(2).Info("update conflict while updating Workspace status, will requeue")
-				return ctrl.Result{Requeue: true}, nil
-			}
-			log.Error(err, "unable to update Workspace status")
-			return ctrl.Result{}, err
-		}
+
+		// return and requeue to pick up the changes
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// generate StatefulSet
@@ -246,7 +245,7 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	var statefulSetName string
 	ownedStatefulSets := &appsv1.StatefulSetList{}
 	listOpts := &client.ListOptions{
-		FieldSelector: fields.OneTermEqualSelector(kbCacheWorkspaceOwnerKey, workspace.Name),
+		FieldSelector: fields.OneTermEqualSelector(helper.IndexWorkspaceOwnerField, workspace.Name),
 		Namespace:     req.Namespace,
 	}
 	if err := r.List(ctx, ownedStatefulSets, listOpts); err != nil {
@@ -255,7 +254,8 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// reconcile StatefulSet
-	if len(ownedStatefulSets.Items) > 1 {
+	switch numSts := len(ownedStatefulSets.Items); {
+	case numSts > 1:
 		statefulSetList := make([]string, len(ownedStatefulSets.Items))
 		for i, sts := range ownedStatefulSets.Items {
 			statefulSetList[i] = sts.Name
@@ -266,14 +266,14 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			kubefloworgv1beta1.WorkspaceStateError,
 			fmt.Sprintf(stateMsgErrorMultipleStatefulSets, statefulSetListString),
 		)
-	} else if len(ownedStatefulSets.Items) == 0 {
+	case numSts == 0:
 		if err := r.Create(ctx, statefulSet); err != nil {
 			log.Error(err, "unable to create StatefulSet")
 			return ctrl.Result{}, err
 		}
 		statefulSetName = statefulSet.ObjectMeta.Name
 		log.V(2).Info("StatefulSet created", "statefulSet", statefulSetName)
-	} else {
+	default:
 		foundStatefulSet := &ownedStatefulSets.Items[0]
 		statefulSetName = foundStatefulSet.ObjectMeta.Name
 		if helper.CopyStatefulSetFields(statefulSet, foundStatefulSet) {
@@ -310,7 +310,7 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	var serviceName string
 	ownedServices := &corev1.ServiceList{}
 	listOpts = &client.ListOptions{
-		FieldSelector: fields.OneTermEqualSelector(kbCacheWorkspaceOwnerKey, workspace.Name),
+		FieldSelector: fields.OneTermEqualSelector(helper.IndexWorkspaceOwnerField, workspace.Name),
 		Namespace:     req.Namespace,
 	}
 	if err := r.List(ctx, ownedServices, listOpts); err != nil {
@@ -319,10 +319,11 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// reconcile Service
-	if len(ownedServices.Items) > 1 {
+	switch numServices := len(ownedServices.Items); {
+	case numServices > 1:
 		serviceList := make([]string, len(ownedServices.Items))
-		for i, sts := range ownedServices.Items {
-			serviceList[i] = sts.Name
+		for i, svc := range ownedServices.Items {
+			serviceList[i] = svc.Name
 		}
 		serviceListString := strings.Join(serviceList, ", ")
 		log.Error(nil, "Workspace owns multiple Services", "services", serviceListString)
@@ -330,14 +331,14 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			kubefloworgv1beta1.WorkspaceStateError,
 			fmt.Sprintf(stateMsgErrorMultipleServices, serviceListString),
 		)
-	} else if len(ownedServices.Items) == 0 {
+	case numServices == 0:
 		if err := r.Create(ctx, service); err != nil {
 			log.Error(err, "unable to create Service")
 			return ctrl.Result{}, err
 		}
 		serviceName = service.ObjectMeta.Name
 		log.V(2).Info("Service created", "service", serviceName)
-	} else {
+	default:
 		foundService := &ownedServices.Items[0]
 		serviceName = foundService.ObjectMeta.Name
 		if helper.CopyServiceFields(service, foundService) {
@@ -371,13 +372,15 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 	}
 
-	// update Workspace status
+	// populate the Workspace status
 	workspaceStatus, err := r.generateWorkspaceStatus(ctx, log, workspace, pod, statefulSet)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if !reflect.DeepEqual(workspace.Status, workspaceStatus) {
-		workspace.Status = workspaceStatus
+	workspace.Status = workspaceStatus
+
+	// update the Workspace status, if it has changed
+	if !equality.Semantic.DeepEqual(currentStatus, workspace.Status) {
 		if err := r.Status().Update(ctx, workspace); err != nil {
 			if apierrors.IsConflict(err) {
 				log.V(2).Info("update conflict while updating Workspace status, will requeue")
@@ -392,58 +395,10 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *WorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// Index Event by `involvedObject.uid`
-	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Event{}, kfCacheEventInvolvedObjectUidKey, func(rawObj client.Object) []string {
-		event := rawObj.(*corev1.Event)
-		if event.InvolvedObject.UID == "" {
-			return nil
-		}
-		return []string{string(event.InvolvedObject.UID)}
-	}); err != nil {
-		return err
-	}
+func (r *WorkspaceReconciler) SetupWithManager(mgr ctrl.Manager, opts controller.Options) error {
 
-	// Index StatefulSet by owner
-	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &appsv1.StatefulSet{}, kbCacheWorkspaceOwnerKey, func(rawObj client.Object) []string {
-		statefulSet := rawObj.(*appsv1.StatefulSet)
-		owner := metav1.GetControllerOf(statefulSet)
-		if owner == nil {
-			return nil
-		}
-		if owner.APIVersion != apiGroupVersionStr || owner.Kind != "Workspace" {
-			return nil
-		}
-		return []string{owner.Name}
-	}); err != nil {
-		return err
-	}
-
-	// Index Service by owner
-	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Service{}, kbCacheWorkspaceOwnerKey, func(rawObj client.Object) []string {
-		service := rawObj.(*corev1.Service)
-		owner := metav1.GetControllerOf(service)
-		if owner == nil {
-			return nil
-		}
-		if owner.APIVersion != apiGroupVersionStr || owner.Kind != "Workspace" {
-			return nil
-		}
-		return []string{owner.Name}
-	}); err != nil {
-		return err
-	}
-
-	// Index Workspace by WorkspaceKind
-	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &kubefloworgv1beta1.Workspace{}, kbCacheWorkspaceKindField, func(rawObj client.Object) []string {
-		ws := rawObj.(*kubefloworgv1beta1.Workspace)
-		if ws.Spec.Kind == "" {
-			return nil
-		}
-		return []string{ws.Spec.Kind}
-	}); err != nil {
-		return err
-	}
+	// NOTE: the SetupManagerFieldIndexers() helper in `helper/index.go` should have already been
+	//       called on `mgr` by the time this function is called, so the indexes are already set up
 
 	// function to convert pod events to reconcile requests for workspaces
 	mapPodToRequest := func(ctx context.Context, object client.Object) []reconcile.Request {
@@ -464,6 +419,7 @@ func (r *WorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	})
 
 	return ctrl.NewControllerManagedBy(mgr).
+		WithOptions(opts).
 		For(&kubefloworgv1beta1.Workspace{}).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
@@ -481,7 +437,7 @@ func (r *WorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 // updateWorkspaceState attempts to immediately update the Workspace status with the provided state and message
-func (r *WorkspaceReconciler) updateWorkspaceState(ctx context.Context, log logr.Logger, workspace *kubefloworgv1beta1.Workspace, state kubefloworgv1beta1.WorkspaceState, message string) (ctrl.Result, error) { // nolint:unparam
+func (r *WorkspaceReconciler) updateWorkspaceState(ctx context.Context, log logr.Logger, workspace *kubefloworgv1beta1.Workspace, state kubefloworgv1beta1.WorkspaceState, message string) (ctrl.Result, error) { //nolint:unparam
 	if workspace == nil {
 		return ctrl.Result{}, fmt.Errorf("provided Workspace was nil")
 	}
@@ -504,7 +460,7 @@ func (r *WorkspaceReconciler) updateWorkspaceState(ctx context.Context, log logr
 func (r *WorkspaceReconciler) mapWorkspaceKindToRequest(ctx context.Context, workspaceKind client.Object) []reconcile.Request {
 	attachedWorkspaces := &kubefloworgv1beta1.WorkspaceList{}
 	listOps := &client.ListOptions{
-		FieldSelector: fields.OneTermEqualSelector(kbCacheWorkspaceKindField, workspaceKind.GetName()),
+		FieldSelector: fields.OneTermEqualSelector(helper.IndexWorkspaceKindField, workspaceKind.GetName()),
 		Namespace:     "", // fetch Workspaces in all namespaces
 	}
 	err := r.List(ctx, attachedWorkspaces, listOps)
@@ -535,7 +491,7 @@ func getImageConfig(workspace *kubefloworgv1beta1.Workspace, workspaceKind *kube
 	currentImageConfigKey := workspace.Spec.PodTemplate.Options.ImageConfig
 	currentImageConfig, ok := imageConfigIdMap[currentImageConfigKey]
 	if !ok {
-		return nil, nil, nil, fmt.Errorf("imageConfig with id '%s' not found", currentImageConfigKey)
+		return nil, nil, nil, fmt.Errorf("imageConfig with id %q not found", currentImageConfigKey)
 	}
 
 	// follow any redirects to get the desired imageConfig
@@ -547,11 +503,11 @@ func getImageConfig(workspace *kubefloworgv1beta1.Workspace, workspaceKind *kube
 			break
 		}
 		if visitedNodes[desiredImageConfig.Redirect.To] {
-			return nil, nil, nil, fmt.Errorf("imageConfig with id '%s' has a circular redirect", desiredImageConfig.Id)
+			return nil, nil, nil, fmt.Errorf("imageConfig with id %q has a circular redirect", desiredImageConfig.Id)
 		}
 		nextNode, ok := imageConfigIdMap[desiredImageConfig.Redirect.To]
 		if !ok {
-			return nil, nil, nil, fmt.Errorf("imageConfig with id '%s' not found, was redirected from '%s'", desiredImageConfig.Redirect.To, desiredImageConfig.Id)
+			return nil, nil, nil, fmt.Errorf("imageConfig with id %q not found, was redirected from %q", desiredImageConfig.Redirect.To, desiredImageConfig.Id)
 		}
 		redirectChain = append(redirectChain, kubefloworgv1beta1.WorkspacePodOptionRedirectStep{
 			Source: desiredImageConfig.Id,
@@ -580,7 +536,7 @@ func getPodConfig(workspace *kubefloworgv1beta1.Workspace, workspaceKind *kubefl
 	currentPodConfigKey := workspace.Spec.PodTemplate.Options.PodConfig
 	currentPodConfig, ok := podConfigIdMap[currentPodConfigKey]
 	if !ok {
-		return nil, nil, nil, fmt.Errorf("podConfig with id '%s' not found", currentPodConfigKey)
+		return nil, nil, nil, fmt.Errorf("podConfig with id %q not found", currentPodConfigKey)
 	}
 
 	// follow any redirects to get the desired podConfig
@@ -592,11 +548,11 @@ func getPodConfig(workspace *kubefloworgv1beta1.Workspace, workspaceKind *kubefl
 			break
 		}
 		if visitedNodes[desiredPodConfig.Redirect.To] {
-			return nil, nil, nil, fmt.Errorf("podConfig with id '%s' has a circular redirect", desiredPodConfig.Id)
+			return nil, nil, nil, fmt.Errorf("podConfig with id %q has a circular redirect", desiredPodConfig.Id)
 		}
 		nextNode, ok := podConfigIdMap[desiredPodConfig.Redirect.To]
 		if !ok {
-			return nil, nil, nil, fmt.Errorf("podConfig with id '%s' not found, was redirected from '%s'", desiredPodConfig.Redirect.To, desiredPodConfig.Id)
+			return nil, nil, nil, fmt.Errorf("podConfig with id %q not found, was redirected from %q", desiredPodConfig.Redirect.To, desiredPodConfig.Id)
 		}
 		redirectChain = append(redirectChain, kubefloworgv1beta1.WorkspacePodOptionRedirectStep{
 			Source: desiredPodConfig.Id,
@@ -641,8 +597,25 @@ func generateStatefulSet(workspace *kubefloworgv1beta1.Workspace, workspaceKind 
 	}
 
 	// generate pod metadata
-	podAnnotations := labels.Merge(workspaceKind.Spec.PodTemplate.PodMetadata.Annotations, workspace.Spec.PodTemplate.PodMetadata.Annotations)
-	podLabels := labels.Merge(workspaceKind.Spec.PodTemplate.PodMetadata.Labels, workspace.Spec.PodTemplate.PodMetadata.Labels)
+	// NOTE: pod metadata from the Workspace takes precedence over the WorkspaceKind
+	podAnnotations := make(map[string]string)
+	podLabels := make(map[string]string)
+	if workspaceKind.Spec.PodTemplate.PodMetadata != nil {
+		for k, v := range workspaceKind.Spec.PodTemplate.PodMetadata.Annotations {
+			podAnnotations[k] = v
+		}
+		for k, v := range workspaceKind.Spec.PodTemplate.PodMetadata.Labels {
+			podLabels[k] = v
+		}
+	}
+	if workspace.Spec.PodTemplate.PodMetadata != nil {
+		for k, v := range workspace.Spec.PodTemplate.PodMetadata.Annotations {
+			podAnnotations[k] = v
+		}
+		for k, v := range workspace.Spec.PodTemplate.PodMetadata.Labels {
+			podLabels[k] = v
+		}
+	}
 
 	// generate container imagePullPolicy
 	imagePullPolicy := corev1.PullIfNotPresent
@@ -683,27 +656,16 @@ func generateStatefulSet(workspace *kubefloworgv1beta1.Workspace, workspaceKind 
 	// generate container env
 	containerEnv := make([]corev1.EnvVar, len(workspaceKind.Spec.PodTemplate.ExtraEnv))
 	for i, env := range workspaceKind.Spec.PodTemplate.ExtraEnv {
+		env := env.DeepCopy() // copy to avoid modifying the original
 		if env.Value != "" {
 			rawValue := env.Value
-
-			tmpl, err := template.New("value").
-				Funcs(template.FuncMap{"httpPathPrefix": httpPathPrefixFunc}).
-				Parse(rawValue)
+			outValue, err := helper.RenderExtraEnvValueTemplate(rawValue, httpPathPrefixFunc)
 			if err != nil {
-				err = fmt.Errorf("failed to parse template for extraEnv '%s': %w", env.Name, err)
-				return nil, err
+				return nil, fmt.Errorf("failed to render extraEnv %q: %w", env.Name, err)
 			}
-
-			var buf bytes.Buffer
-			err = tmpl.Execute(&buf, nil)
-			if err != nil {
-				err = fmt.Errorf("failed to execute template for extraEnv '%s': %w", env.Name, err)
-				return nil, err
-			}
-
-			env.Value = buf.String()
+			env.Value = outValue
 		}
-		containerEnv[i] = env
+		containerEnv[i] = *env
 	}
 
 	// generate container resources
@@ -847,7 +809,7 @@ func generateStatefulSet(workspace *kubefloworgv1beta1.Workspace, workspaceKind 
 					Affinity: podConfigSpec.Affinity,
 					Containers: []corev1.Container{
 						{
-							Name:            "main",
+							Name:            workspacePodTemplateContainerName,
 							Image:           imageConfigSpec.Image,
 							ImagePullPolicy: imagePullPolicy,
 							Ports:           containerPorts,
@@ -921,11 +883,14 @@ func generateService(workspace *kubefloworgv1beta1.Workspace, imageConfigSpec ku
 
 // generateWorkspaceStatus generates a WorkspaceStatus for a Workspace
 func (r *WorkspaceReconciler) generateWorkspaceStatus(ctx context.Context, log logr.Logger, workspace *kubefloworgv1beta1.Workspace, pod *corev1.Pod, statefulSet *appsv1.StatefulSet) (kubefloworgv1beta1.WorkspaceStatus, error) {
+	// NOTE: some fields are populated before this function is called,
+	//       including `status.pendingRestart` and `status.podTemplateOptions`
 	status := workspace.Status
 
 	// if workspace is paused, update the `status.pauseTime`
 	// NOTE: when the workspace is not paused, the pauseTime should be 0
-	if *workspace.Spec.Paused {
+	workspacePaused := ptr.Deref(workspace.Spec.Paused, false)
+	if workspacePaused {
 		if status.PauseTime == 0 {
 			status.PauseTime = metav1.Now().Unix()
 		}
@@ -935,24 +900,76 @@ func (r *WorkspaceReconciler) generateWorkspaceStatus(ctx context.Context, log l
 		}
 	}
 
+	// populate the pod information
+	status.PodTemplatePod = generateWorkspacePodStatus(pod)
+
+	// populate the workspace state and state message
+	workspaceState, workspaceStateMessage, err := r.generateWorkspaceState(ctx, log, workspacePaused, statefulSet, pod)
+	if err != nil {
+		return status, err
+	}
+	status.State = workspaceState
+	status.StateMessage = workspaceStateMessage
+
+	return status, nil
+}
+
+// generateWorkspacePodStatus generates a WorkspacePodStatus for a Pod
+func generateWorkspacePodStatus(pod *corev1.Pod) kubefloworgv1beta1.WorkspacePodStatus {
+	podStatus := kubefloworgv1beta1.WorkspacePodStatus{}
+
+	// return an empty status if the Pod is nil
+	if pod == nil {
+		return podStatus
+	}
+
+	// populate the name
+	podStatus.Name = pod.Name
+
+	// populate the containers
+	containers := make([]kubefloworgv1beta1.WorkspacePodContainer, len(pod.Spec.Containers))
+	for i, container := range pod.Spec.Containers {
+		containers[i] = kubefloworgv1beta1.WorkspacePodContainer{
+			Name: container.Name,
+		}
+	}
+	podStatus.Containers = containers
+
+	// populate the initContainers
+	initContainers := make([]kubefloworgv1beta1.WorkspacePodContainer, len(pod.Spec.InitContainers))
+	for i, container := range pod.Spec.InitContainers {
+		initContainers[i] = kubefloworgv1beta1.WorkspacePodContainer{
+			Name: container.Name,
+		}
+	}
+	podStatus.InitContainers = initContainers
+
+	return podStatus
+}
+
+// generateWorkspaceState gets current state and stateMessage for a Workspace
+func (r *WorkspaceReconciler) generateWorkspaceState(ctx context.Context, log logr.Logger, paused bool, statefulSet *appsv1.StatefulSet, pod *corev1.Pod) (kubefloworgv1beta1.WorkspaceState, string, error) {
+	state := kubefloworgv1beta1.WorkspaceStateUnknown
+	stateMessage := stateMsgUnknown
+
 	// cases where the Pod does not exist
 	if pod == nil {
 		// STATUS: Paused
-		if *workspace.Spec.Paused {
-			status.State = kubefloworgv1beta1.WorkspaceStatePaused
-			status.StateMessage = stateMsgPaused
-			return status, nil
+		if paused {
+			state = kubefloworgv1beta1.WorkspaceStatePaused
+			stateMessage = stateMsgPaused
+			return state, stateMessage, nil
 		}
 
 		// there might be StatefulSet events
 		statefulSetEvents := &corev1.EventList{}
 		listOpts := &client.ListOptions{
-			FieldSelector: fields.OneTermEqualSelector(kfCacheEventInvolvedObjectUidKey, string(statefulSet.UID)),
+			FieldSelector: fields.OneTermEqualSelector(helper.IndexEventInvolvedObjectUidField, string(statefulSet.UID)),
 			Namespace:     statefulSet.Namespace,
 		}
 		if err := r.List(ctx, statefulSetEvents, listOpts); err != nil {
 			log.Error(err, "unable to list StatefulSet events")
-			return status, err
+			return state, stateMessage, err
 		}
 
 		// find the last StatefulSet warning event
@@ -972,9 +989,9 @@ func (r *WorkspaceReconciler) generateWorkspaceStatus(ctx context.Context, log l
 
 		// STATUS: Error (StatefulSet warning event)
 		if lastStsWarningEvent != nil {
-			status.State = kubefloworgv1beta1.WorkspaceStateError
-			status.StateMessage = fmt.Sprintf(stateMsgErrorStatefulSetWarningEvent, lastStsWarningEvent.Message)
-			return status, nil
+			state = kubefloworgv1beta1.WorkspaceStateError
+			stateMessage = fmt.Sprintf(stateMsgErrorStatefulSetWarningEvent, lastStsWarningEvent.Message)
+			return state, stateMessage, nil
 		}
 	}
 
@@ -982,9 +999,9 @@ func (r *WorkspaceReconciler) generateWorkspaceStatus(ctx context.Context, log l
 	if pod != nil {
 		// STATUS: Terminating
 		if pod.GetDeletionTimestamp() != nil {
-			status.State = kubefloworgv1beta1.WorkspaceStateTerminating
-			status.StateMessage = stateMsgTerminating
-			return status, nil
+			state = kubefloworgv1beta1.WorkspaceStateTerminating
+			stateMessage = stateMsgTerminating
+			return state, stateMessage, nil
 		}
 
 		// get the pod phase
@@ -996,7 +1013,7 @@ func (r *WorkspaceReconciler) generateWorkspaceStatus(ctx context.Context, log l
 		var podScheduledCondition corev1.PodCondition
 		var podReadyCondition corev1.PodCondition
 		for _, condition := range pod.Status.Conditions {
-			switch condition.Type {
+			switch condition.Type { //nolint:exhaustive
 			case corev1.PodScheduled:
 				podScheduledCondition = condition
 			case corev1.PodReady:
@@ -1012,32 +1029,32 @@ func (r *WorkspaceReconciler) generateWorkspaceStatus(ctx context.Context, log l
 		if !podScheduled {
 			switch podScheduledCondition.Reason {
 			case corev1.PodReasonUnschedulable:
-				status.State = kubefloworgv1beta1.WorkspaceStateError
-				status.StateMessage = fmt.Sprintf(stateMsgErrorPodUnschedulable, podScheduledCondition.Message)
-				return status, nil
+				state = kubefloworgv1beta1.WorkspaceStateError
+				stateMessage = fmt.Sprintf(stateMsgErrorPodUnschedulable, podScheduledCondition.Message)
+				return state, stateMessage, nil
 			case corev1.PodReasonSchedulingGated:
-				status.State = kubefloworgv1beta1.WorkspaceStateError
-				status.StateMessage = fmt.Sprintf(stateMsgErrorPodSchedulingGate, podScheduledCondition.Message)
-				return status, nil
+				state = kubefloworgv1beta1.WorkspaceStateError
+				stateMessage = fmt.Sprintf(stateMsgErrorPodSchedulingGate, podScheduledCondition.Message)
+				return state, stateMessage, nil
 			case corev1.PodReasonSchedulerError:
-				status.State = kubefloworgv1beta1.WorkspaceStateError
-				status.StateMessage = fmt.Sprintf(stateMsgErrorPodSchedulerError, podScheduledCondition.Message)
-				return status, nil
+				state = kubefloworgv1beta1.WorkspaceStateError
+				stateMessage = fmt.Sprintf(stateMsgErrorPodSchedulerError, podScheduledCondition.Message)
+				return state, stateMessage, nil
 			}
 		}
 
 		// STATUS: Running
 		if podPhase == corev1.PodRunning && podReady {
-			status.State = kubefloworgv1beta1.WorkspaceStateRunning
-			status.StateMessage = stateMsgRunning
-			return status, nil
+			state = kubefloworgv1beta1.WorkspaceStateRunning
+			stateMessage = stateMsgRunning
+			return state, stateMessage, nil
 		}
 
 		// get container status
 		// https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#container-states
 		var containerStatus corev1.ContainerStatus
 		for _, container := range pod.Status.ContainerStatuses {
-			if container.Name == "main" {
+			if container.Name == workspacePodTemplateContainerName {
 				containerStatus = container
 				break
 			}
@@ -1049,27 +1066,24 @@ func (r *WorkspaceReconciler) generateWorkspaceStatus(ctx context.Context, log l
 		// STATUS: Error (container state)
 		if containerState.Waiting != nil {
 			if containerState.Waiting.Reason == "CrashLoopBackOff" {
-				status.State = kubefloworgv1beta1.WorkspaceStateError
-				status.StateMessage = stateMsgErrorContainerCrashLoopBackOff
-				return status, nil
+				state = kubefloworgv1beta1.WorkspaceStateError
+				stateMessage = stateMsgErrorContainerCrashLoopBackOff
+				return state, stateMessage, nil
 			}
 			if containerState.Waiting.Reason == "ImagePullBackOff" {
-				status.State = kubefloworgv1beta1.WorkspaceStateError
-				status.StateMessage = stateMsgErrorContainerImagePullBackOff
-				return status, nil
+				state = kubefloworgv1beta1.WorkspaceStateError
+				stateMessage = stateMsgErrorContainerImagePullBackOff
+				return state, stateMessage, nil
 			}
 		}
 
 		// STATUS: Pending
 		if podPhase == corev1.PodPending {
-			status.State = kubefloworgv1beta1.WorkspaceStatePending
-			status.StateMessage = stateMsgPending
-			return status, nil
+			state = kubefloworgv1beta1.WorkspaceStatePending
+			stateMessage = stateMsgPending
+			return state, stateMessage, nil
 		}
 	}
 
-	// STATUS: Unknown
-	status.State = kubefloworgv1beta1.WorkspaceStateUnknown
-	status.StateMessage = stateMsgUnknown
-	return status, nil
+	return state, stateMessage, nil
 }

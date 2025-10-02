@@ -1,0 +1,9 @@
+labels:
+- pairs:
+    app.kubernetes.io/component: webhook
+
+resources:
+- certificate.yaml
+
+configurations:
+- kustomizeconfig.yaml

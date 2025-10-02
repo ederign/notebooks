@@ -29,14 +29,17 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	kubefloworgv1beta1 "github.com/kubeflow/notebooks/workspaces/controller/api/v1beta1"
-	"github.com/kubeflow/notebooks/workspaces/controller/internal/controller"
-	//+kubebuilder:scaffold:imports
+	controllerInternal "github.com/kubeflow/notebooks/workspaces/controller/internal/controller"
+	"github.com/kubeflow/notebooks/workspaces/controller/internal/helper"
+	webhookInternal "github.com/kubeflow/notebooks/workspaces/controller/internal/webhook"
+	// +kubebuilder:scaffold:imports
 )
 
 var (
@@ -48,7 +51,7 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(kubefloworgv1beta1.AddToScheme(scheme))
-	//+kubebuilder:scaffold:scheme
+	// +kubebuilder:scaffold:scheme
 }
 
 func main() {
@@ -115,6 +118,8 @@ func main() {
 		// the manager stops, so would be fine to enable this option. However,
 		// if you are doing or is intended to do any operation such as perform cleanups
 		// after the manager stops then its usage might be unsafe.
+		//
+		// TODO: check if we are doing anything which would prevent us from using this option.
 		// LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
@@ -122,21 +127,51 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controller.WorkspaceReconciler{
+	// setup field indexers on the manager cache. we use these indexes to efficiently
+	// query the cache for things like which Workspaces are using a particular WorkspaceKind
+	if err := helper.SetupManagerFieldIndexers(mgr); err != nil {
+		setupLog.Error(err, "unable to setup field indexers")
+		os.Exit(1)
+	}
+
+	if err = (&controllerInternal.WorkspaceReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
+	}).SetupWithManager(mgr, controller.Options{
+		RateLimiter: helper.BuildRateLimiter(),
+	}); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Workspace")
 		os.Exit(1)
 	}
-	if err = (&controller.WorkspaceKindReconciler{
+	if err = (&controllerInternal.WorkspaceKindReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
+	}).SetupWithManager(mgr, controller.Options{
+		RateLimiter: helper.BuildRateLimiter(),
+	}); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "WorkspaceKind")
 		os.Exit(1)
 	}
-	//+kubebuilder:scaffold:builder
+	// +kubebuilder:scaffold:builder
+
+	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		if err = (&webhookInternal.WorkspaceValidator{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+		}).SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "Workspace")
+			os.Exit(1)
+		}
+	}
+	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		if err = (&webhookInternal.WorkspaceKindValidator{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+		}).SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "WorkspaceKind")
+			os.Exit(1)
+		}
+	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")

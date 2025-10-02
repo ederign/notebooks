@@ -1,22 +1,43 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import App from '@app/index';
+import { BrowserRouter as Router } from 'react-router-dom';
+import {
+  BrowserStorageContextProvider,
+  ModularArchConfig,
+  ModularArchContextProvider,
+  NotificationContextProvider,
+} from 'mod-arch-core';
+import { ThemeProvider } from 'mod-arch-kubeflow';
+import App from './app/App';
+import {
+  DEPLOYMENT_MODE,
+  URL_PREFIX,
+  BFF_API_VERSION,
+  STYLE_THEME,
+  MANDATORY_NAMESPACE,
+} from './shared/utilities/const';
 
-if (process.env.NODE_ENV !== 'production') {
-  const config = {
-    rules: [
-      {
-        id: 'color-contrast',
-        enabled: false
-      }
-    ]
-  };
-}
+const root = ReactDOM.createRoot(document.getElementById('root')!);
 
-const root = ReactDOM.createRoot(document.getElementById('root') as Element);
+const modularArchConfig: ModularArchConfig = {
+  deploymentMode: DEPLOYMENT_MODE,
+  URL_PREFIX,
+  BFF_API_VERSION,
+  mandatoryNamespace: MANDATORY_NAMESPACE,
+};
 
 root.render(
   <React.StrictMode>
-    <App />
-  </React.StrictMode>
+    <Router basename={URL_PREFIX}>
+      <ModularArchContextProvider config={modularArchConfig}>
+        <ThemeProvider theme={STYLE_THEME}>
+          <BrowserStorageContextProvider>
+            <NotificationContextProvider>
+              <App />
+            </NotificationContextProvider>
+          </BrowserStorageContextProvider>
+        </ThemeProvider>
+      </ModularArchContextProvider>
+    </Router>
+  </React.StrictMode>,
 );

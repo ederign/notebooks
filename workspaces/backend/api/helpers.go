@@ -20,17 +20,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"mime"
 	"net/http"
 	"strings"
 )
 
-type Envelope map[string]any
+// Envelope is the body of all requests and responses that contain data.
+// NOTE: error responses use the ErrorEnvelope type
+type Envelope[D any] struct {
+	// TODO: make all declarations of Envelope use pointers for D
 
-func (app *App) WriteJSON(w http.ResponseWriter, status int, data any, headers http.Header) error {
+	Data D `json:"data"`
+}
+
+// WriteJSON writes a JSON response with the given status code, data, and headers.
+func (a *App) WriteJSON(w http.ResponseWriter, status int, data any, headers http.Header) error {
 
 	js, err := json.MarshalIndent(data, "", "\t")
-
 	if err != nil {
 		return err
 	}
@@ -41,63 +47,67 @@ func (app *App) WriteJSON(w http.ResponseWriter, status int, data any, headers h
 		w.Header()[key] = value
 	}
 
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", MediaTypeJson)
 	w.WriteHeader(status)
-	w.Write(js)
+	_, err = w.Write(js)
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
 
-func (app *App) ReadJSON(w http.ResponseWriter, r *http.Request, dst any) error {
-
-	maxBytes := 1_048_576
-	r.Body = http.MaxBytesReader(w, r.Body, int64(maxBytes))
-
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-
-	err := dec.Decode(dst)
-
-	if err != nil {
-		var syntaxError *json.SyntaxError
-		var unmarshalTypeError *json.UnmarshalTypeError
-		var invalidUnmarshalError *json.InvalidUnmarshalError
-		var maxBytesError *http.MaxBytesError
-
-		switch {
-		case errors.As(err, &syntaxError):
-			return fmt.Errorf("body contains badly-formed JSON (at character %d)", syntaxError.Offset)
-
-		case errors.Is(err, io.ErrUnexpectedEOF):
-			return errors.New("body contains badly-formed JSON")
-
-		case errors.As(err, &unmarshalTypeError):
-			if unmarshalTypeError.Field != "" {
-				return fmt.Errorf("body contains incorrect JSON type for field %q", unmarshalTypeError.Field)
-			}
-			return fmt.Errorf("body contains incorrect JSON type (at character %d)", unmarshalTypeError.Offset)
-
-		case errors.Is(err, io.EOF):
-			return errors.New("body must not be empty")
-
-		case errors.As(err, &maxBytesError):
-			return fmt.Errorf("body must not be larger than %d bytes", maxBytesError.Limit)
-
-		case strings.HasPrefix(err.Error(), "json: unknown field "):
-			fieldName := strings.TrimPrefix(err.Error(), "json: unknown field ")
-			return fmt.Errorf("body contains unknown key %s", fieldName)
-
-		case errors.As(err, &invalidUnmarshalError):
-			panic(err)
-		default:
+// DecodeJSON decodes the JSON request body into the given value.
+func (a *App) DecodeJSON(r *http.Request, v any) error {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(v); err != nil {
+		// NOTE: we don't wrap this error so we can unpack it in the caller
+		if a.IsMaxBytesError(err) {
 			return err
 		}
+		return fmt.Errorf("error decoding JSON: %w", err)
 	}
-
-	err = dec.Decode(&struct{}{})
-	if !errors.Is(err, io.EOF) {
-		return errors.New("body must only contain a single JSON value")
-	}
-
 	return nil
+}
+
+// IsMaxBytesError checks if the error is an instance of http.MaxBytesError.
+func (a *App) IsMaxBytesError(err error) bool {
+	var maxBytesError *http.MaxBytesError
+	return errors.As(err, &maxBytesError)
+}
+
+// ValidateContentType validates the Content-Type header of the request.
+// If this method returns false, the request has been handled and the caller should return immediately.
+// If this method returns true, the request has the correct Content-Type.
+func (a *App) ValidateContentType(w http.ResponseWriter, r *http.Request, expectedMediaType string) bool {
+	contentType := r.Header.Get("Content-Type")
+	if contentType == "" {
+		a.unsupportedMediaTypeResponse(w, r, fmt.Errorf("Content-Type header is missing"))
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		a.badRequestResponse(w, r, fmt.Errorf("error parsing Content-Type header: %w", err))
+		return false
+	}
+	if mediaType != expectedMediaType {
+		a.unsupportedMediaTypeResponse(w, r, fmt.Errorf("unsupported media type: %s, expected: %s", mediaType, expectedMediaType))
+		return false
+	}
+
+	return true
+}
+
+// LocationGetWorkspace returns the GET location (HTTP path) for a workspace resource.
+func (a *App) LocationGetWorkspace(namespace, name string) string {
+	path := strings.Replace(WorkspacesByNamePath, ":"+NamespacePathParam, namespace, 1)
+	path = strings.Replace(path, ":"+ResourceNamePathParam, name, 1)
+	return path
+}
+
+// LocationGetWorkspaceKind returns the GET location (HTTP path) for a workspace kind resource.
+func (a *App) LocationGetWorkspaceKind(name string) string {
+	path := strings.Replace(WorkspaceKindsByNamePath, ":"+ResourceNamePathParam, name, 1)
+	return path
 }

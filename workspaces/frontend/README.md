@@ -6,38 +6,92 @@ The Kubeflow Workspaces Frontend is the web user interface used to monitor and m
 > The Kubeflow Workspaces Frontend is a work in progress and is __NOT__ currently ready for use.
 > We greatly appreciate any contributions.
 
+# Dev Setup
 
-## Pre-requisites:
+## Requirements
 
-TBD
+This project requires the following tools to be installed on your system:
+
+- [NodeJS and NPM](https://nodejs.org/)
+  - Node recommended version -> `20.17.0`
+  - NPM recommended version -> `10.8.2`
 
 ## Development
 
-```sh
-# Install development/build dependencies
-npm install
+1. Clone the repository:
 
-# Start the development server
-npm run start:dev
+      ``` bash
+      git clone https://github.com/kubeflow/notebooks.git
+      ```
 
-# Run a production build (outputs to "dist" dir)
-npm run build
+2. Checkout the Notebooks 2.0 development branch:
 
-# Run the test suite
-npm run test
+      ``` bash
+      git checkout notebooks-v2
+      ```
 
-# Run the test suite with coverage
-npm run test:coverage
+3. Navigate to the `frontend` directory and install the project dependencies.
 
-# Run the linter
-npm run lint
+     ```bash
+     cd workspaces/frontend && npm install
+     ```
 
-# Run the code formatter
-npm run format
+### Build the Project
 
-# Launch a tool to inspect the bundle size
-npm run bundle-profile:analyze
+  ```bash
+  npm run build
+  ```
 
-# Start the express server (run a production build first)
-npm run start
+### Serve the UI Locally
+
+This is the default setup for running the UI locally. Make sure you build the project using the instructions above prior to running the command below.
+
+  ```bash
+  npm run start:dev
+  ```
+
+The command above starts the UI with mocked data by default, so you can run the application without requiring a connection to the backend. This behavior can be customized in the `.env.development` file by setting the `MOCK_API_ENABLED` environment variable to `false`.
+
+### Testing
+
+Run all tests:
+
+  ```bash
+  npm run test
+  ```
+
+### Linting
+
+Check for linting issues:
+
+  ```bash
+  npm run test:lint
+  ```
+
+Automatically fix linting issues:
+
+  ```bash
+  npm run test:fix
+  ```
+
+### API Types & Client Generation
+
+The TypeScript types and the HTTP client layer for interacting with the backend APIs are automatically generated from the backend's `swagger.json` file. This ensures the frontend remains aligned with the backend API contract at all times.
+
+#### Generated Code Location
+
+All generated files live in the `src/generated` directory.
+
+⚠️ Do not manually edit any files in this folder.
+
+#### Updating the Generated Code
+
+To update the generated code, first update the `swagger.version` file in the `scripts` directory to the desired commit hash of the backend's `swagger.json` file.
+
+Then run the following command to update the generated code:
+
+```bash
+npm run generate:api
 ```
+
+Finally, make any necessary adaptations based on the changes in the generated code.

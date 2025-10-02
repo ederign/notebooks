@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -41,7 +42,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	kubefloworgv1beta1 "github.com/kubeflow/notebooks/workspaces/controller/api/v1beta1"
-	//+kubebuilder:scaffold:imports
+	"github.com/kubeflow/notebooks/workspaces/controller/internal/helper"
+	// +kubebuilder:scaffold:imports
 )
 
 // These tests use Ginkgo (BDD-style Go testing framework). Refer to
@@ -76,7 +78,7 @@ var _ = BeforeSuite(func() {
 		// If not informed it will look for the default path defined in controller-runtime which is /usr/local/kubebuilder/.
 		// Note that you must have the required binaries setup under the bin directory to perform the tests directly.
 		// When we run make test it will be setup and used automatically.
-		BinaryAssetsDirectory: filepath.Join("..", "..", "bin", "k8s", fmt.Sprintf("1.29.0-%s-%s", runtime.GOOS, runtime.GOARCH)),
+		BinaryAssetsDirectory: filepath.Join("..", "..", "bin", "k8s", fmt.Sprintf("1.31.0-%s-%s", runtime.GOOS, runtime.GOARCH)),
 	}
 	var err error
 	cfg, err = testEnv.Start()
@@ -87,7 +89,7 @@ var _ = BeforeSuite(func() {
 	err = kubefloworgv1beta1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 
-	//+kubebuilder:scaffold:scheme
+	// +kubebuilder:scaffold:scheme
 
 	By("creating the k8s client")
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
@@ -101,26 +103,34 @@ var _ = BeforeSuite(func() {
 			BindAddress: "0", // disable metrics serving
 		},
 	})
-	Expect(err).ToNot(HaveOccurred())
+	Expect(err).NotTo(HaveOccurred())
+
+	By("setting up the field indexers for the controller manager")
+	err = helper.SetupManagerFieldIndexers(k8sManager)
+	Expect(err).NotTo(HaveOccurred())
 
 	By("setting up the Workspace controller")
 	err = (&WorkspaceReconciler{
 		Client: k8sManager.GetClient(),
 		Scheme: k8sManager.GetScheme(),
-	}).SetupWithManager(k8sManager)
-	Expect(err).ToNot(HaveOccurred())
+	}).SetupWithManager(k8sManager, controller.Options{
+		RateLimiter: helper.BuildRateLimiter(),
+	})
+	Expect(err).NotTo(HaveOccurred())
 
 	By("setting up the WorkspaceKind controller")
 	err = (&WorkspaceKindReconciler{
 		Client: k8sManager.GetClient(),
 		Scheme: k8sManager.GetScheme(),
-	}).SetupWithManager(k8sManager)
-	Expect(err).ToNot(HaveOccurred())
+	}).SetupWithManager(k8sManager, controller.Options{
+		RateLimiter: helper.BuildRateLimiter(),
+	})
+	Expect(err).NotTo(HaveOccurred())
 
 	go func() {
 		defer GinkgoRecover()
 		err = k8sManager.Start(ctx)
-		Expect(err).ToNot(HaveOccurred(), "failed to run manager")
+		Expect(err).NotTo(HaveOccurred(), "failed to run manager")
 	}()
 
 })
@@ -257,6 +267,7 @@ func NewExampleWorkspaceKind1(name string) *kubefloworgv1beta1.WorkspaceKind {
 						},
 						Values: []kubefloworgv1beta1.ImageConfigValue{
 							{
+								// WARNING: do not change the ID of this value or remove it, it is used in the tests
 								Id: "jupyterlab_scipy_180",
 								Spawner: kubefloworgv1beta1.OptionSpawnerInfo{
 									DisplayName: "jupyter-scipy:v1.8.0",
@@ -277,7 +288,7 @@ func NewExampleWorkspaceKind1(name string) *kubefloworgv1beta1.WorkspaceKind {
 									},
 								},
 								Spec: kubefloworgv1beta1.ImageConfigSpec{
-									Image: "docker.io/kubeflownotebookswg/jupyter-scipy:v1.8.0",
+									Image: "ghcr.io/kubeflow/kubeflow/notebook-servers/jupyter-scipy:v1.8.0",
 									Ports: []kubefloworgv1beta1.ImagePort{
 										{
 											Id:          "jupyterlab",
@@ -289,6 +300,7 @@ func NewExampleWorkspaceKind1(name string) *kubefloworgv1beta1.WorkspaceKind {
 								},
 							},
 							{
+								// WARNING: do not change the ID of this value or remove it, it is used in the tests
 								Id: "jupyterlab_scipy_190",
 								Spawner: kubefloworgv1beta1.OptionSpawnerInfo{
 									DisplayName: "jupyter-scipy:v1.9.0",
@@ -301,7 +313,7 @@ func NewExampleWorkspaceKind1(name string) *kubefloworgv1beta1.WorkspaceKind {
 									},
 								},
 								Spec: kubefloworgv1beta1.ImageConfigSpec{
-									Image: "docker.io/kubeflownotebookswg/jupyter-scipy:v1.9.0",
+									Image: "ghcr.io/kubeflow/kubeflow/notebook-servers/jupyter-scipy:v1.9.0",
 									Ports: []kubefloworgv1beta1.ImagePort{
 										{
 											Id:          "jupyterlab",
@@ -320,6 +332,7 @@ func NewExampleWorkspaceKind1(name string) *kubefloworgv1beta1.WorkspaceKind {
 						},
 						Values: []kubefloworgv1beta1.PodConfigValue{
 							{
+								// WARNING: do not change the ID of this value or remove it, it is used in the tests
 								Id: "tiny_cpu",
 								Spawner: kubefloworgv1beta1.OptionSpawnerInfo{
 									DisplayName: "Tiny CPU",
@@ -345,6 +358,7 @@ func NewExampleWorkspaceKind1(name string) *kubefloworgv1beta1.WorkspaceKind {
 								},
 							},
 							{
+								// WARNING: do not change the ID of this value or remove it, it is used in the tests
 								Id: "small_cpu",
 								Spawner: kubefloworgv1beta1.OptionSpawnerInfo{
 									DisplayName: "Small CPU",
@@ -370,6 +384,7 @@ func NewExampleWorkspaceKind1(name string) *kubefloworgv1beta1.WorkspaceKind {
 								},
 							},
 							{
+								// WARNING: do not change the ID of this value or remove it, it is used in the tests
 								Id: "big_gpu",
 								Spawner: kubefloworgv1beta1.OptionSpawnerInfo{
 									DisplayName: "Big GPU",
